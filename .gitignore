@@ -1,0 +1,17 @@
+.DS_Store
+*.log
+*.tmp
+*.swp
+
+.env
+*.env
+
+tmp/
+temp/
+dist/
+build/
+
+__pycache__/
+*.py[cod]
+
+node_modules/

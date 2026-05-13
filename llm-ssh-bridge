@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UP="${ROOT}/scripts/bastion-up.sh"
+RUN="${ROOT}/scripts/bastion-run.sh"
+
+usage() {
+  cat <<EOF
+Usage:
+  ./llm-ssh-bridge up
+  ./llm-ssh-bridge attach
+  ./llm-ssh-bridge status
+  ./llm-ssh-bridge doctor
+  ./llm-ssh-bridge reset
+  ./llm-ssh-bridge down
+  ./llm-ssh-bridge clean [--all]
+  ./llm-ssh-bridge run [run-options] '<command>'
+
+Examples:
+  ./llm-ssh-bridge up
+  ./llm-ssh-bridge run 'hostname && pwd'
+  ./llm-ssh-bridge run -t 120 'find /var/log -type f | head'
+  ./llm-ssh-bridge doctor
+EOF
+}
+
+cmd="${1:-help}"
+case "${cmd}" in
+  help|--help|-h)
+    usage
+    ;;
+  up|attach|status|doctor|reset|down|clean)
+    exec "${UP}" "$@"
+    ;;
+  run)
+    shift
+    exec "${RUN}" "$@"
+    ;;
+  *)
+    echo "unknown command: ${cmd}" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
