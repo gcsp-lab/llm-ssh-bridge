@@ -1,4 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# shellcheck shell=bash
+# shellcheck source=_locale-bootstrap.sh
+. "$(dirname "$0")/_locale-bootstrap.sh"
+
 # Manage a manually authenticated bastion tmux session.
 
 set -euo pipefail
@@ -11,6 +15,9 @@ SPOOL_RETENTION_MINUTES="${BASTION_SPOOL_RETENTION_MINUTES:-1440}"
 DEFAULT_BASTION_HOST="${BASTION_DEFAULT_HOST:-example.com}"
 DEFAULT_BASTION_PORT="${BASTION_DEFAULT_PORT:-22}"
 DEFAULT_BASTION_USER="${BASTION_DEFAULT_USER:-${USER:-}}"
+BASTION_HOST="${BASTION_HOST:-}"
+BASTION_PORT="${BASTION_PORT:-}"
+BASTION_USER="${BASTION_USER:-}"
 
 usage() {
   cat <<EOF
@@ -99,6 +106,7 @@ BASTION_HOST="${BASTION_HOST}"
 BASTION_PORT="${BASTION_PORT}"
 BASTION_USER="${BASTION_USER}"
 EOF
+  chmod 600 "${CONFIG_FILE}"
   echo "Saved ${CONFIG_FILE}."
 }
 

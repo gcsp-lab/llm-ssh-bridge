@@ -1,5 +1,42 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# shellcheck shell=bash
+if [ -z "${BASTION_TEST_BASH_BOOTSTRAPPED:-}" ]; then
+  if [ -n "${LC_ALL:-}" ] && [ "${LC_ALL}" != "C" ] && [ "${LC_ALL}" != "POSIX" ] \
+    && ! locale -a 2>/dev/null | grep -Fxq "${LC_ALL}"; then
+    for candidate in C.UTF-8 en_US.UTF-8 C; do
+      if [ "${candidate}" = "C" ] || locale -a 2>/dev/null | grep -Fxq "${candidate}"; then
+        LC_ALL="${candidate}"
+        LANG="${candidate}"
+        export LC_ALL LANG
+        break
+      fi
+    done
+  fi
+  export BASTION_TEST_BASH_BOOTSTRAPPED=1
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
+
+normalize_locale() {
+  local candidate
+  if [[ -n "${LC_ALL:-}" && "${LC_ALL}" != "C" && "${LC_ALL}" != "POSIX" ]] \
+    && ! locale -a 2>/dev/null | grep -Fxq "${LC_ALL}"; then
+    :
+  elif locale >/dev/null 2>&1; then
+    return 0
+  fi
+
+  for candidate in C.UTF-8 en_US.UTF-8 C; do
+    if [[ "${candidate}" == "C" ]] || locale -a 2>/dev/null | grep -Fxq "${candidate}"; then
+      export LC_ALL="${candidate}"
+      export LANG="${candidate}"
+      return 0
+    fi
+  done
+}
+
+normalize_locale
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/bastion-test.XXXXXX")"
@@ -54,17 +91,26 @@ case "$1" in
     if [[ "${*: -1}" == "Enter" ]]; then
       spool="$(cat "${state}/spool")"
       payload="$(cat "${state}/buffer")"
-      start="$(printf '%s\n' "${payload}" | sed -n "s/.*printf '\\\\n%s\\\\n' '\\([^']*\\)'.*/\\1/p")"
-      end="$(printf '%s\n' "${payload}" | sed -n "s/.*printf '%s:%d\\\\n' '\\([^']*\\)'.*/\\1/p")"
-      {
-        printf '\n%s\n' "${start}"
-        i=1
-        while [[ "${i}" -le 300 ]]; do
-          printf 'line-%03d\n' "${i}"
-          i=$((i + 1))
-        done
-        printf '%s:0\n' "${end}"
-      } >> "${spool}"
+      nonce="$(printf '%s\n' "${payload}" | sed -n "s/.*__bstn_nonce='\\([^']*\\)'.*/\\1/p")"
+      start="__BSTN_START_${nonce}__"
+      end="__BSTN_END_${nonce}__"
+      if [[ "${payload}" == *"ansi-sentinel-probe"* ]]; then
+        {
+          printf '\n\033[01;32m%s\033[0m\n' "${start}"
+          printf 'json-body-without-newline'
+          printf '\033[01;31m%s\033[0m:7\n' "${end}"
+        } >> "${spool}"
+      else
+        {
+          printf '\n%s\n' "${start}"
+          i=1
+          while [[ "${i}" -le 300 ]]; do
+            printf 'line-%03d\n' "${i}"
+            i=$((i + 1))
+          done
+          printf '%s:0\n' "${end}"
+        } >> "${spool}"
+      fi
     fi
     ;;
   *) exit 0 ;;
@@ -80,6 +126,7 @@ chmod +x "${TMPDIR}/bin/ssh"
 
 export HOME="${TMPDIR}/home"
 export PATH="${TMPDIR}/bin:${PATH}"
+export BASTION_RUNTIME_DIR="${TMPDIR}"
 export BASTION_SPOOL_DIR="${TMPDIR}/spool"
 export FAKE_TMUX_HAS_SESSION=0
 export BASTION_DEFAULT_HOST="example.com"
@@ -158,11 +205,11 @@ export FAKE_TMUX_HAS_SESSION=0
 "${ROOT}/scripts/bastion-up.sh" clean --all >/dev/null
 "${ROOT}/scripts/bastion-run.sh" clean --all >/dev/null
 
-if "${ROOT}/scripts/bastion-run.sh" 'echo should-not-run' >/tmp/bastion-test.out 2>&1; then
+if "${ROOT}/scripts/bastion-run.sh" 'echo should-not-run' >"${TMPDIR}/missing-session.out" 2>&1; then
   echo "expected bastion-run without a tmux session to fail" >&2
   exit 1
 fi
-missing_session="$(cat /tmp/bastion-test.out)"
+missing_session="$(cat "${TMPDIR}/missing-session.out")"
 assert_contains "${missing_session}" "tmux session"
 assert_contains "${missing_session}" "bastion-up.sh"
 
@@ -176,9 +223,92 @@ last_payload="$(cat "${FAKE_TMUX_STATE}/buffer")"
 assert_contains "${last_payload}" "( long-output-probe )"
 assert_contains "${last_payload}" "case \$- in"
 assert_contains "${last_payload}" "set +e"
+assert_contains "${last_payload}" "COMPOSE_PROGRESS=\"\${COMPOSE_PROGRESS:-plain}\""
+assert_contains "${last_payload}" "NO_COLOR=\"\${NO_COLOR:-1}\""
 
 spool_count="$(find "${TMPDIR}/spool" -type f -name 'run-*.log' | wc -l | awk '{print $1}')"
 if [[ "${spool_count}" != "${spool_count_before}" ]]; then
   echo "expected successful run not to leave a new spool file, found ${spool_count} before ${spool_count_before}" >&2
   exit 1
 fi
+
+lock_dir="${TMPDIR}/lock-bastion"
+mkdir -p "${lock_dir}"
+printf '%s\n' "$(date +%s)" > "${lock_dir}/created_at"
+printf '999999\n' > "${lock_dir}/pid"
+set +e
+recent_lock_output="$("${ROOT}/scripts/bastion-run.sh" -t 5 'recent-lock-probe' 2>&1)"
+recent_lock_rc=$?
+set -e
+if [[ "${recent_lock_rc}" != "75" ]]; then
+  echo "expected recent lock to be treated as busy, got ${recent_lock_rc}" >&2
+  echo "${recent_lock_output}" >&2
+  exit 1
+fi
+assert_contains "${recent_lock_output}" "tmux session bastion is busy"
+if [[ ! -d "${lock_dir}" ]]; then
+  echo "expected busy runner not to remove a lock it does not own" >&2
+  exit 1
+fi
+rm -rf "${lock_dir}"
+
+mkdir -p "${lock_dir}"
+printf '0\n' > "${lock_dir}/created_at"
+printf '999999\n' > "${lock_dir}/pid"
+stale_lock_output="$("${ROOT}/scripts/bastion-run.sh" -t 5 'stale-lock-probe' 2>&1)"
+assert_contains "${stale_lock_output}" "line-001"
+if [[ -d "${lock_dir}" ]]; then
+  echo "expected stale lock to be removed after run" >&2
+  exit 1
+fi
+
+set +e
+"${ROOT}/scripts/bastion-run.sh" --keep-log -t 5 'ansi-sentinel-probe' >"${TMPDIR}/ansi.out" 2>"${TMPDIR}/ansi.err"
+ansi_rc=$?
+set -e
+if [[ "${ansi_rc}" != "7" ]]; then
+  echo "expected ansi-sentinel-probe rc 7, got ${ansi_rc}" >&2
+  cat "${TMPDIR}/ansi.err" >&2
+  exit 1
+fi
+ansi_output="$(cat "${TMPDIR}/ansi.out")"
+assert_contains "${ansi_output}" "json-body-without-newline"
+if grep -q "Timed out" "${TMPDIR}/ansi.err"; then
+  echo "did not expect timeout when END sentinel is ANSI wrapped and follows output without newline" >&2
+  cat "${TMPDIR}/ansi.err" >&2
+  exit 1
+fi
+
+# Hostname guard scaffolding is always present in the payload but inert by default.
+assert_contains "${last_payload}" "__bstn_expected_host=''"
+assert_contains "${last_payload}" "__bstn_actual_host"
+assert_contains "${last_payload}" "hostname mismatch"
+
+# Env override embeds expected hostname in payload.
+BASTION_EXPECTED_HOSTNAME=fake-target "${ROOT}/scripts/bastion-run.sh" -t 5 'env-host-probe' >/dev/null
+env_payload="$(cat "${FAKE_TMUX_STATE}/buffer")"
+assert_contains "${env_payload}" "__bstn_expected_host='fake-target'"
+
+# Pin file is read when no env override is set.
+pin_file="${TMPDIR}/pin-bastion"
+printf 'pinned-host\n' > "${pin_file}"
+BASTION_PIN_FILE="${pin_file}" "${ROOT}/scripts/bastion-run.sh" -t 5 'pin-file-probe' >/dev/null
+pin_payload="$(cat "${FAKE_TMUX_STATE}/buffer")"
+assert_contains "${pin_payload}" "__bstn_expected_host='pinned-host'"
+
+# --no-host-check overrides pin file.
+BASTION_PIN_FILE="${pin_file}" "${ROOT}/scripts/bastion-run.sh" -t 5 --no-host-check 'no-host-check-probe' >/dev/null
+nohost_payload="$(cat "${FAKE_TMUX_STATE}/buffer")"
+assert_contains "${nohost_payload}" "__bstn_expected_host=''"
+rm -f "${pin_file}"
+
+# `pin` subcommand probes hostname and writes pin file.
+fresh_pin="${TMPDIR}/new-pin"
+rm -f "${fresh_pin}"
+BASTION_PIN_FILE="${fresh_pin}" "${ROOT}/scripts/bastion-run.sh" pin >/dev/null
+if [[ ! -f "${fresh_pin}" ]]; then
+  echo "expected pin file to be created at ${fresh_pin}" >&2
+  exit 1
+fi
+pinned_content="$(cat "${fresh_pin}")"
+assert_contains "${pinned_content}" "line-300"

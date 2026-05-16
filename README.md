@@ -28,11 +28,29 @@ Then run commands through the prepared session:
 ./llm-ssh-bridge doctor         # check dependencies, config, session, and pane output
 ./llm-ssh-bridge reset          # stop local tmux session, then start it again
 ./llm-ssh-bridge down           # stop local tmux session
+./llm-ssh-bridge pin            # pin the current remote hostname as a guard
 ./llm-ssh-bridge clean [--all]  # clean spool files
 ./llm-ssh-bridge run '<cmd>'    # execute one command through the prepared session
 ```
 
 The implementation scripts live in `scripts/`.
+
+## Hostname Guard
+
+If the SSH session drops mid-way and the tmux pane lands on a different shell (the bastion host's local shell, a different target after re-routing, etc.), `run` would otherwise execute commands on the wrong host. To defend against this, pin the expected remote hostname:
+
+```bash
+./llm-ssh-bridge pin
+```
+
+This probes `hostname` over the current session and writes the result to `~/.ssh/bastion-pin-${BASTION_SESSION}` (default `~/.ssh/bastion-pin-bastion`). Subsequent `run` invocations prepend a check to the payload; if the remote `hostname` no longer matches the pinned value, the command is not executed and the run exits with code 99.
+
+Re-pin after any reconnection or target change. Override or disable per-run:
+
+```bash
+BASTION_EXPECTED_HOSTNAME=other-host ./llm-ssh-bridge run 'uptime'
+./llm-ssh-bridge run --no-host-check 'uptime'
+```
 
 ## Spool Files
 

@@ -1,4 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# shellcheck shell=bash
+# shellcheck source=scripts/_locale-bootstrap.sh
+. "$(dirname "$0")/scripts/_locale-bootstrap.sh"
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,11 +18,13 @@ Usage:
   ./llm-ssh-bridge doctor
   ./llm-ssh-bridge reset
   ./llm-ssh-bridge down
+  ./llm-ssh-bridge pin
   ./llm-ssh-bridge clean [--all]
   ./llm-ssh-bridge run [run-options] '<command>'
 
 Examples:
   ./llm-ssh-bridge up
+  ./llm-ssh-bridge pin
   ./llm-ssh-bridge run 'hostname && pwd'
   ./llm-ssh-bridge run -t 120 'find /var/log -type f | head'
   ./llm-ssh-bridge doctor
@@ -35,6 +41,9 @@ case "${cmd}" in
     ;;
   run)
     shift
+    exec "${RUN}" "$@"
+    ;;
+  pin)
     exec "${RUN}" "$@"
     ;;
   *)
