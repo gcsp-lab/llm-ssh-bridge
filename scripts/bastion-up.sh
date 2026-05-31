@@ -15,9 +15,11 @@ SPOOL_RETENTION_MINUTES="${BASTION_SPOOL_RETENTION_MINUTES:-1440}"
 DEFAULT_BASTION_HOST="${BASTION_DEFAULT_HOST:-example.com}"
 DEFAULT_BASTION_PORT="${BASTION_DEFAULT_PORT:-22}"
 DEFAULT_BASTION_USER="${BASTION_DEFAULT_USER:-${USER:-}}"
+DEFAULT_BASTION_SSH_OPTIONS="${BASTION_DEFAULT_SSH_OPTIONS:-}"
 BASTION_HOST="${BASTION_HOST:-}"
 BASTION_PORT="${BASTION_PORT:-}"
 BASTION_USER="${BASTION_USER:-}"
+BASTION_SSH_OPTIONS="${BASTION_SSH_OPTIONS:-}"
 
 usage() {
   cat <<EOF
@@ -41,6 +43,7 @@ Environment:
   BASTION_DEFAULT_HOST            Default: ${DEFAULT_BASTION_HOST}
   BASTION_DEFAULT_PORT            Default: ${DEFAULT_BASTION_PORT}
   BASTION_DEFAULT_USER            Default: ${DEFAULT_BASTION_USER}
+  BASTION_DEFAULT_SSH_OPTIONS     Default: ${DEFAULT_BASTION_SSH_OPTIONS}
 EOF
 }
 
@@ -105,6 +108,7 @@ save_config() {
 BASTION_HOST="${BASTION_HOST}"
 BASTION_PORT="${BASTION_PORT}"
 BASTION_USER="${BASTION_USER}"
+BASTION_SSH_OPTIONS="${BASTION_SSH_OPTIONS}"
 EOF
   chmod 600 "${CONFIG_FILE}"
   echo "Saved ${CONFIG_FILE}."
@@ -122,6 +126,7 @@ configure_bastion() {
   prompt_with_default BASTION_HOST "Bastion host or IP" "${BASTION_HOST:-${DEFAULT_BASTION_HOST}}"
   prompt_with_default BASTION_PORT "Bastion port" "${BASTION_PORT:-${DEFAULT_BASTION_PORT}}"
   prompt_with_default BASTION_USER "Bastion user" "${BASTION_USER:-${DEFAULT_BASTION_USER}}"
+  prompt_with_default BASTION_SSH_OPTIONS "Extra SSH options" "${BASTION_SSH_OPTIONS:-${DEFAULT_BASTION_SSH_OPTIONS}}"
   save_config
 }
 
@@ -248,12 +253,25 @@ start_session() {
 
   local target="${BASTION_USER}@${BASTION_HOST}"
   local port="${BASTION_PORT:-22}"
+  local ssh_options="${BASTION_SSH_OPTIONS:-}"
+  local ssh_command
 
   echo "Starting ssh to ${target}:${port} inside tmux ${SESSION}."
+  # Keepalive reduces silent connection drops (which otherwise force a fresh
+  # password+OTP login). 30s probes, give up after ~2min of no response.
+  local keepalive="-o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o TCPKeepAlive=yes"
+  if [[ -n "${ssh_options}" ]]; then
+    echo "Using extra SSH options: ${ssh_options}"
+    ssh_command="TERM=xterm ssh ${keepalive} ${ssh_options} -p ${port} ${target}"
+  else
+    ssh_command="TERM=xterm ssh ${keepalive} -p ${port} ${target}"
+  fi
   echo "Sequence: enter password, enter OTP if prompted, choose the target host."
   echo "After landing in the target shell, detach with Ctrl-b then d."
   sleep 1
-  exec tmux new-session -s "${SESSION}" "TERM=xterm ssh -p ${port} ${target}"
+  tmux new-session -d -s "${SESSION}" "${ssh_command}"
+  tmux set-option -t "${SESSION}" mouse off
+  exec tmux attach -t "${SESSION}"
 }
 
 cmd="${1:-up}"

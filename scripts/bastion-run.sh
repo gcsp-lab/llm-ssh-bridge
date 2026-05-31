@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SESSION="${BASTION_SESSION:-bastion}"
-TIMEOUT=60
+TIMEOUT="${BASTION_DEFAULT_TIMEOUT:-120}"
 RUNTIME_DIR="${BASTION_RUNTIME_DIR:-${TMPDIR:-/tmp}/bastion-run}"
 SPOOL_DIR="${BASTION_SPOOL_DIR:-${RUNTIME_DIR}/spool}"
 SPOOL_RETENTION_MINUTES="${BASTION_SPOOL_RETENTION_MINUTES:-1440}"
@@ -353,16 +353,20 @@ load_expected_host() {
 
 send_payload() {
   local nonce nonce_q expected_q payload buffer_name spool_q
-  local payload_head payload_check payload_body payload_tail
+  local payload_head payload_check payload_body payload_tail cmd_b64
   nonce="$(make_nonce)"
   START="__BSTN_START_${nonce}__"
   END="__BSTN_END_${nonce}__"
   nonce_q="$(quote_for_remote_single "${nonce}")"
   expected_q="$(quote_for_remote_single "${EXPECTED_HOST}")"
+  # base64-frame the command: paste a single fixed-shape line so quotes,
+  # pipes, newlines and non-ASCII in the command can never corrupt the
+  # interactive paste. Decoded and run on the remote.
+  cmd_b64="$(printf '%s' "${CMD}" | base64 | tr -d '\n')"
 
   payload_head="__bstn_nonce='${nonce_q}'; __bstn_start=\"__BSTN_START_\${__bstn_nonce}__\"; __bstn_end=\"__BSTN_END_\${__bstn_nonce}__\"; __bstn_expected_host='${expected_q}'; case \$- in *e*) __bstn_had_errexit=1 ;; *) __bstn_had_errexit=0 ;; esac; set +e; export COMPOSE_PROGRESS=\"\${COMPOSE_PROGRESS:-plain}\" NO_COLOR=\"\${NO_COLOR:-1}\"; printf '\\n%s\\n' \"\$__bstn_start\";"
   payload_check="__bstn_actual_host=\"\$(hostname 2>/dev/null)\"; if [ -n \"\$__bstn_expected_host\" ] && [ \"\$__bstn_actual_host\" != \"\$__bstn_expected_host\" ]; then printf '[bastion-run] hostname mismatch: expected=%s actual=%s\\n' \"\$__bstn_expected_host\" \"\$__bstn_actual_host\" >&2; __rc=99; else"
-  payload_body=" ( ${CMD} ); __rc=\$?; fi;"
+  payload_body=" ( printf '%s' '${cmd_b64}' | base64 --decode | bash ); __rc=\$?; fi;"
   payload_tail=" if [[ \"\$__bstn_had_errexit\" == 1 ]]; then set -e; fi; printf '%s:%d\\n' \"\$__bstn_end\" \"\$__rc\""
 
   payload="${payload_head} ${payload_check}${payload_body}${payload_tail}"
@@ -405,6 +409,27 @@ parse_end_from_text() {
     fi
   done <<< "${clean}"
 
+  return 1
+}
+
+recover_pane() {
+  local attempt max_attempts prompt_re pane_tail
+  max_attempts="${BASTION_RECOVER_ATTEMPTS:-5}"
+  prompt_re="${BASTION_PROMPT_TAIL_REGEX:-[\$#>%][[:space:]]*\$}"
+
+  echo "[bastion-run] Attempting pane recovery (Ctrl-C + wait prompt)..." >&2
+  for attempt in $(seq 1 "${max_attempts}"); do
+    tmux send-keys -t "${SESSION}" C-c 2>/dev/null || true
+    sleep 1.5
+    pane_tail="$(tmux capture-pane -p -t "${SESSION}" 2>/dev/null \
+      | awk 'NF{line=$0} END{print line}' 2>/dev/null || true)"
+    if [[ -n "${pane_tail}" ]] && [[ "${pane_tail}" =~ ${prompt_re} ]]; then
+      echo "[bastion-run] Pane recovered after ${attempt} attempt(s)." >&2
+      return 0
+    fi
+  done
+  echo "[bastion-run] Pane recovery failed after ${max_attempts} attempts." >&2
+  echo "[bastion-run] Attach manually: tmux attach -t ${SESSION}" >&2
   return 1
 }
 
@@ -486,6 +511,8 @@ stream_until_end() {
   echo "[bastion-run] Spool retained: ${SPOOL_FILE}" >&2
   echo "[bastion-run] Recent spool output:" >&2
   recent_spool_tail
+  disable_pipe
+  recover_pane || true
   return 124
 }
 

@@ -71,6 +71,9 @@ case "$1" in
   new-session)
     printf '%s\n' "$*" > "${state}/new-session"
     ;;
+  set-option)
+    printf '%s\n' "$*" > "${state}/set-option"
+    ;;
   pipe-pane)
     if [[ $# -gt 3 ]]; then
       cmd="${*:4}"
@@ -94,7 +97,8 @@ case "$1" in
       nonce="$(printf '%s\n' "${payload}" | sed -n "s/.*__bstn_nonce='\\([^']*\\)'.*/\\1/p")"
       start="__BSTN_START_${nonce}__"
       end="__BSTN_END_${nonce}__"
-      if [[ "${payload}" == *"ansi-sentinel-probe"* ]]; then
+      ansi_b64="$(printf '%s' 'ansi-sentinel-probe' | base64 | tr -d '\n')"
+      if [[ "${payload}" == *"${ansi_b64}"* ]]; then
         {
           printf '\n\033[01;32m%s\033[0m\n' "${start}"
           printf 'json-body-without-newline'
@@ -132,6 +136,7 @@ export FAKE_TMUX_HAS_SESSION=0
 export BASTION_DEFAULT_HOST="example.com"
 export BASTION_DEFAULT_PORT="2222"
 export BASTION_DEFAULT_USER="default-user"
+export BASTION_DEFAULT_SSH_OPTIONS=""
 
 assert_contains() {
   local haystack="$1"
@@ -166,27 +171,34 @@ assert_contains "${doctor}" "Dependencies"
 assert_contains "${doctor}" "Session"
 
 rm -f "${HOME}/.ssh/bastion.env"
-first_up="$(printf '\n\n\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
+first_up="$(printf '\n\n\n\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
 assert_contains "${first_up}" "Bastion host or IP [example.com]"
 assert_contains "${first_up}" "Bastion port [2222]"
 assert_contains "${first_up}" "Bastion user [default-user]"
+assert_contains "${first_up}" "Extra SSH options []"
 saved_config="$(cat "${HOME}/.ssh/bastion.env")"
 assert_contains "${saved_config}" 'BASTION_HOST="example.com"'
 assert_contains "${saved_config}" 'BASTION_PORT="2222"'
 assert_contains "${saved_config}" 'BASTION_USER="default-user"'
+assert_contains "${saved_config}" 'BASTION_SSH_OPTIONS=""'
 new_session="$(cat "${FAKE_TMUX_STATE}/new-session")"
-assert_contains "${new_session}" "ssh -p 2222 default-user@example.com"
+assert_contains "${new_session}" "-p 2222 default-user@example.com"
+assert_contains "${new_session}" "ServerAliveInterval=30"
+set_option="$(cat "${FAKE_TMUX_STATE}/set-option")"
+assert_contains "${set_option}" "mouse off"
 
-second_up="$(printf 'custom.example\n2023\ncustom-user\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
+second_up="$(printf 'custom.example\n2023\ncustom-user\n-o HostKeyAlgorithms=+ssh-rsa\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
 assert_contains "${second_up}" "Bastion host or IP [example.com]"
 assert_contains "${second_up}" "Bastion port [2222]"
 assert_contains "${second_up}" "Bastion user [default-user]"
+assert_contains "${second_up}" "Extra SSH options []"
 saved_config="$(cat "${HOME}/.ssh/bastion.env")"
 assert_contains "${saved_config}" 'BASTION_HOST="custom.example"'
 assert_contains "${saved_config}" 'BASTION_PORT="2023"'
 assert_contains "${saved_config}" 'BASTION_USER="custom-user"'
+assert_contains "${saved_config}" 'BASTION_SSH_OPTIONS="-o HostKeyAlgorithms=+ssh-rsa"'
 new_session="$(cat "${FAKE_TMUX_STATE}/new-session")"
-assert_contains "${new_session}" "ssh -p 2023 custom-user@custom.example"
+assert_contains "${new_session}" "-o HostKeyAlgorithms=+ssh-rsa -p 2023 custom-user@custom.example"
 
 export FAKE_TMUX_HAS_SESSION=1
 attach_existing="$(printf '\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
@@ -195,7 +207,7 @@ assert_contains "${attach_existing}" "Attach existing session"
 attach_session="$(cat "${FAKE_TMUX_STATE}/attach")"
 assert_contains "${attach_session}" "-t bastion"
 
-restart_existing="$(printf 'n\n\n\n\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
+restart_existing="$(printf 'n\n\n\n\n\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
 assert_contains "${restart_existing}" "Restarting tmux bastion"
 assert_contains "${restart_existing}" "Bastion host or IP [custom.example]"
 kill_session="$(cat "${FAKE_TMUX_STATE}/kill-session")"
@@ -220,7 +232,8 @@ long_output="$("${ROOT}/scripts/bastion-run.sh" -t 5 'long-output-probe')"
 assert_contains "${long_output}" "line-001"
 assert_contains "${long_output}" "line-300"
 last_payload="$(cat "${FAKE_TMUX_STATE}/buffer")"
-assert_contains "${last_payload}" "( long-output-probe )"
+assert_contains "${last_payload}" "base64 --decode | bash"
+assert_contains "${last_payload}" "$(printf '%s' 'long-output-probe' | base64 | tr -d '\n')"
 assert_contains "${last_payload}" "case \$- in"
 assert_contains "${last_payload}" "set +e"
 assert_contains "${last_payload}" "COMPOSE_PROGRESS=\"\${COMPOSE_PROGRESS:-plain}\""
