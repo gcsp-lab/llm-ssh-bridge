@@ -25,21 +25,29 @@ PIPE_ENABLED=0
 START=""
 END=""
 CMD=""
+MODE=""
+REMOTE_JOB_DIR="\$HOME/.bastion-jobs"
 
 usage() {
   cat <<EOF
 Usage:
   $0 [options] '<command>'
+  $0 --bg '<command>'           Launch async; prints a job id
+  $0 --poll <job-id>            Report an async job's status + output
+  $0 get <remote> [local]       Download a file (scp/sftp blocked by bastion)
+  $0 put <local> <remote>       Upload a file
   $0 pin
   $0 clean [--all]
 
 Options:
-  -t, --timeout SECONDS       Command timeout, default: 60
+  -t, --timeout SECONDS       Command timeout, default: 120
   -s, --session SESSION       tmux session name, default: bastion
       --spool-dir DIR         Spool directory, default: /tmp/bastion-run/spool
       --keep-log              Keep successful run spool file
       --no-keep-failed-log    Delete spool file even on failure or timeout
       --no-host-check         Skip the pinned-hostname guard for this run
+      --bg, --background      Run async in the background; prints a job id
+      --poll                  With a job id arg: report status + output
   -h, --help                  Show this help
 
 Environment:
@@ -184,6 +192,18 @@ parse_args() {
     exit $?
   fi
 
+  if [[ "${1:-}" == "get" ]]; then
+    shift
+    do_get "$@"
+    exit $?
+  fi
+
+  if [[ "${1:-}" == "put" ]]; then
+    shift
+    do_put "$@"
+    exit $?
+  fi
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help)
@@ -227,6 +247,14 @@ parse_args() {
         ;;
       --no-host-check)
         NO_HOST_CHECK=1
+        shift
+        ;;
+      --bg|--background)
+        MODE="bg"
+        shift
+        ;;
+      --poll)
+        MODE="poll"
         shift
         ;;
       --)
@@ -516,10 +544,78 @@ stream_until_end() {
   return 124
 }
 
+self_path() {
+  printf '%s' "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+}
+
+# Fast-fail when the ssh/bastion link is visibly dead, instead of waiting out
+# the full timeout and then failing pane recovery.
+detect_dead_session() {
+  local tail
+  tail="$(tmux capture-pane -p -t "${SESSION}" 2>/dev/null | awk 'NF{l=$0} END{print l}' 2>/dev/null || true)"
+  [[ -z "${tail}" ]] && return 0
+  if printf '%s' "${tail}" | grep -qiE 'broken pipe|connection (closed|reset|refused)|client_loop|no route to host|timed out'; then
+    echo "[bastion-run] tmux ${SESSION} looks disconnected (last line: ${tail})." >&2
+    echo "[bastion-run] The SSH/bastion link dropped — re-authenticate: ./scripts/bastion-up.sh up" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Rewrite CMD for async modes. Both still flow through the normal
+# send_payload/stream_until_end path (and thus B1 base64 framing).
+apply_mode() {
+  case "${MODE}" in
+    bg)
+      local job b64
+      job="bj-$(date +%s)-${RANDOM}${RANDOM}"
+      b64="$(printf '%s' "${CMD}" | base64 | tr -d '\n')"
+      CMD="mkdir -p \"${REMOTE_JOB_DIR}\"; nohup bash -c 'printf %s \"${b64}\" | base64 --decode | bash; echo \$? > \"${REMOTE_JOB_DIR}/${job}.rc\"' > \"${REMOTE_JOB_DIR}/${job}.log\" 2>&1 & echo \"${job}\""
+      ;;
+    poll)
+      local job="${CMD}"
+      if [[ ! "${job}" =~ ^bj-[0-9]+-[0-9]+$ ]]; then
+        echo "[bastion-run] --poll needs a job id from --bg (got: ${job})" >&2
+        exit 1
+      fi
+      CMD="J=\"${REMOTE_JOB_DIR}/${job}\"; if [ -f \"\$J.rc\" ]; then echo \"=== BASTION_JOB ${job} DONE rc=\$(cat \"\$J.rc\") ===\"; cat \"\$J.log\"; else echo \"=== BASTION_JOB ${job} RUNNING ===\"; tail -n 300 \"\$J.log\" 2>/dev/null; fi"
+      ;;
+  esac
+}
+
+# Pull a remote file to local via base64 over the pane (scp/sftp are blocked
+# by the bastion's no-forwarding policy). Good for moderate files.
+do_get() {
+  local remote="${1:-}" out="${2:-}"
+  if [[ -z "${remote}" ]]; then echo "usage: get <remote-path> [local-path]" >&2; return 1; fi
+  [[ -n "${out}" ]] || out="$(basename "${remote}")"
+  local b64
+  if ! b64="$("$(self_path)" -t "${TIMEOUT}" "base64 < $(printf '%q' "${remote}") | tr -d '\n'")"; then
+    echo "[bastion-run] get failed: could not read ${remote}" >&2
+    return 1
+  fi
+  printf '%s' "${b64}" | base64 --decode > "${out}" || { echo "[bastion-run] get: decode failed" >&2; return 1; }
+  echo "[bastion-run] got ${remote} -> ${out} ($(wc -c < "${out}" | tr -d ' ') bytes)"
+}
+
+# Push a local file to the remote via base64 over the pane.
+do_put() {
+  local in="${1:-}" remote="${2:-}"
+  if [[ -z "${in}" || -z "${remote}" ]]; then echo "usage: put <local-path> <remote-path>" >&2; return 1; fi
+  if [[ ! -f "${in}" ]]; then echo "[bastion-run] put: local file not found: ${in}" >&2; return 1; fi
+  local b64; b64="$(base64 < "${in}" | tr -d '\n')"
+  if ! "$(self_path)" -t "${TIMEOUT}" "printf %s '${b64}' | base64 --decode > $(printf '%q' "${remote}")"; then
+    echo "[bastion-run] put failed: could not write ${remote}" >&2
+    return 1
+  fi
+  echo "[bastion-run] put ${in} -> ${remote} ($(wc -c < "${in}" | tr -d ' ') bytes)"
+}
+
 main() {
   parse_args "$@"
   check_deps
   ensure_runtime_dirs
+  apply_mode
 
   [[ -n "${LOCK_STALE_SECONDS}" ]] || LOCK_STALE_SECONDS=$((TIMEOUT + 5))
   load_expected_host
@@ -530,6 +626,7 @@ main() {
     echo "[bastion-run] Start and prepare it with: ./scripts/bastion-up.sh up" >&2
     exit 1
   fi
+  detect_dead_session || exit 2
   verify_prompt_ready || exit 1
   make_spool_file
   send_payload

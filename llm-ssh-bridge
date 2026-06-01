@@ -43,7 +43,7 @@ case "${cmd}" in
     shift
     exec "${RUN}" "$@"
     ;;
-  pin)
+  pin|get|put)
     exec "${RUN}" "$@"
     ;;
   *)
