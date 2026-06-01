@@ -170,36 +170,47 @@ doctor="$("${ROOT}/scripts/bastion-up.sh" doctor 2>&1)"
 assert_contains "${doctor}" "Dependencies"
 assert_contains "${doctor}" "Session"
 
-rm -f "${HOME}/.ssh/bastion.env"
-first_up="$(printf '\n\n\n\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
-assert_contains "${first_up}" "Bastion host or IP [example.com]"
-assert_contains "${first_up}" "Bastion port [2222]"
-assert_contains "${first_up}" "Bastion user [default-user]"
-assert_contains "${first_up}" "Extra SSH options []"
-saved_config="$(cat "${HOME}/.ssh/bastion.env")"
-assert_contains "${saved_config}" 'BASTION_HOST="example.com"'
-assert_contains "${saved_config}" 'BASTION_PORT="2222"'
-assert_contains "${saved_config}" 'BASTION_USER="default-user"'
-assert_contains "${saved_config}" 'BASTION_SSH_OPTIONS=""'
+# --- Named-profile flow ---------------------------------------------------
+rm -rf "${HOME}/.ssh/bastion.env" "${HOME}/.ssh/bastion-profiles" \
+       "${HOME}/.ssh/bastion-last-profile" "${HOME}/.ssh/bastion-active-session"
+
+# First up, no profiles -> create one. Session id "bastion" so the downstream
+# run tests keep targeting that session.
+first_up="$(printf 'LinGang Lab\nbastion\nexample.com\n2222\ndefault-user\n\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
+assert_contains "${first_up}" "Display name"
+assert_contains "${first_up}" "Session id"
+profile="$(cat "${HOME}/.ssh/bastion-profiles/bastion.env")"
+assert_contains "${profile}" 'BASTION_LABEL="LinGang Lab"'
+assert_contains "${profile}" 'BASTION_SESSION="bastion"'
+assert_contains "${profile}" 'BASTION_HOST="example.com"'
+assert_contains "${profile}" 'BASTION_PORT="2222"'
+assert_contains "${profile}" 'BASTION_USER="default-user"'
+assert_contains "$(cat "${HOME}/.ssh/bastion-active-session")" "bastion"
+assert_contains "$(cat "${HOME}/.ssh/bastion-last-profile")" "bastion"
 new_session="$(cat "${FAKE_TMUX_STATE}/new-session")"
+assert_contains "${new_session}" "-s bastion"
 assert_contains "${new_session}" "-p 2222 default-user@example.com"
 assert_contains "${new_session}" "ServerAliveInterval=30"
 set_option="$(cat "${FAKE_TMUX_STATE}/set-option")"
 assert_contains "${set_option}" "mouse off"
 
-second_up="$(printf 'custom.example\n2023\ncustom-user\n-o HostKeyAlgorithms=+ssh-rsa\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
-assert_contains "${second_up}" "Bastion host or IP [example.com]"
-assert_contains "${second_up}" "Bastion port [2222]"
-assert_contains "${second_up}" "Bastion user [default-user]"
-assert_contains "${second_up}" "Extra SSH options []"
-saved_config="$(cat "${HOME}/.ssh/bastion.env")"
-assert_contains "${saved_config}" 'BASTION_HOST="custom.example"'
-assert_contains "${saved_config}" 'BASTION_PORT="2023"'
-assert_contains "${saved_config}" 'BASTION_USER="custom-user"'
-assert_contains "${saved_config}" 'BASTION_SSH_OPTIONS="-o HostKeyAlgorithms=+ssh-rsa"'
+# Second up -> profile picker; last-used profile is default + marked.
+second_up="$(printf '\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
+assert_contains "${second_up}" "Available profiles"
+assert_contains "${second_up}" "LinGang Lab"
+assert_contains "${second_up}" "[last]"
+
+# "+ new profile" path (option 2 in a 1-profile list) with custom ssh options.
+new_profile_up="$(printf '2\nCustom Cluster\ncustom\ncustom.example\n2023\ncustom-user\n-o HostKeyAlgorithms=+ssh-rsa\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
+custom_profile="$(cat "${HOME}/.ssh/bastion-profiles/custom.env")"
+assert_contains "${custom_profile}" 'BASTION_SESSION="custom"'
+assert_contains "${custom_profile}" 'BASTION_HOST="custom.example"'
+assert_contains "${custom_profile}" 'BASTION_SSH_OPTIONS="-o HostKeyAlgorithms=+ssh-rsa"'
 new_session="$(cat "${FAKE_TMUX_STATE}/new-session")"
 assert_contains "${new_session}" "-o HostKeyAlgorithms=+ssh-rsa -p 2023 custom-user@custom.example"
 
+# Existing session -> picker (default=last=bastion), then attach.
+printf 'bastion\n' > "${HOME}/.ssh/bastion-last-profile"
 export FAKE_TMUX_HAS_SESSION=1
 attach_existing="$(printf '\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
 assert_contains "${attach_existing}" "tmux bastion already exists"
@@ -207,11 +218,14 @@ assert_contains "${attach_existing}" "Attach existing session"
 attach_session="$(cat "${FAKE_TMUX_STATE}/attach")"
 assert_contains "${attach_session}" "-t bastion"
 
-restart_existing="$(printf 'n\n\n\n\n\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
+# Decline attach (n) -> restart that session.
+restart_existing="$(printf '\nn\n' | "${ROOT}/scripts/bastion-up.sh" up 2>&1)"
 assert_contains "${restart_existing}" "Restarting tmux bastion"
-assert_contains "${restart_existing}" "Bastion host or IP [custom.example]"
 kill_session="$(cat "${FAKE_TMUX_STATE}/kill-session")"
 assert_contains "${kill_session}" "-t bastion"
+
+# Restore active session = bastion for the remaining run tests.
+printf 'bastion\n' > "${HOME}/.ssh/bastion-active-session"
 
 export FAKE_TMUX_HAS_SESSION=0
 "${ROOT}/scripts/bastion-up.sh" clean --all >/dev/null

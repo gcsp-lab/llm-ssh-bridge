@@ -7,7 +7,17 @@
 
 set -euo pipefail
 
-SESSION="${BASTION_SESSION:-bastion}"
+# Default session follows the last profile `up` activated (see bastion-up.sh),
+# unless overridden by BASTION_SESSION env or -s. Falls back to "bastion".
+# Guard the file read so a missing file can't trip pipefail/set -e at load.
+SESSION="${BASTION_SESSION:-}"
+if [[ -z "${SESSION}" ]]; then
+  _active_session_file="${BASTION_ACTIVE_SESSION_FILE:-${HOME}/.ssh/bastion-active-session}"
+  if [[ -r "${_active_session_file}" ]]; then
+    SESSION="$(head -1 "${_active_session_file}" 2>/dev/null | tr -d '[:space:]')"
+  fi
+fi
+[[ -n "${SESSION}" ]] || SESSION="bastion"
 TIMEOUT="${BASTION_DEFAULT_TIMEOUT:-120}"
 RUNTIME_DIR="${BASTION_RUNTIME_DIR:-${TMPDIR:-/tmp}/bastion-run}"
 SPOOL_DIR="${BASTION_SPOOL_DIR:-${RUNTIME_DIR}/spool}"

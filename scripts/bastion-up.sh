@@ -20,6 +20,11 @@ BASTION_HOST="${BASTION_HOST:-}"
 BASTION_PORT="${BASTION_PORT:-}"
 BASTION_USER="${BASTION_USER:-}"
 BASTION_SSH_OPTIONS="${BASTION_SSH_OPTIONS:-}"
+PROFILES_DIR="${BASTION_PROFILES_DIR:-${HOME}/.ssh/bastion-profiles}"
+LAST_PROFILE_FILE="${BASTION_LAST_PROFILE_FILE:-${HOME}/.ssh/bastion-last-profile}"
+ACTIVE_SESSION_FILE="${BASTION_ACTIVE_SESSION_FILE:-${HOME}/.ssh/bastion-active-session}"
+PROFILE_LABEL=""
+PROFILE_SESSION=""
 
 usage() {
   cat <<EOF
@@ -101,71 +106,160 @@ confirm_default_yes() {
   esac
 }
 
-save_config() {
-  mkdir -p "$(dirname "${CONFIG_FILE}")"
+# --- Named connection profiles ------------------------------------------------
+# Each profile is ~/.ssh/bastion-profiles/<session>.env holding a display
+# LABEL, a tmux SESSION id, and the bastion host/port/user/ssh_options.
+# `up` lets you pick one (default = last used) and connect straight away.
+
+slugify() {
+  # name -> ascii tmux/file-safe id (Chinese etc. stripped -> caller falls back)
+  printf '%s' "${1:-}" | LC_ALL=C tr ' /\\:.@' '------' | LC_ALL=C tr -cd 'A-Za-z0-9_-' \
+    | sed -e 's/^-*//' -e 's/-*$//' | cut -c1-40
+}
+
+write_profile_file() {
+  # args: slug label host port user ssh_options
+  local slug="$1" label="$2" host="$3" port="$4" user="$5" opts="$6"
+  mkdir -p "${PROFILES_DIR}"
   umask 077
-  cat > "${CONFIG_FILE}" <<EOF
-BASTION_HOST="${BASTION_HOST}"
-BASTION_PORT="${BASTION_PORT}"
-BASTION_USER="${BASTION_USER}"
-BASTION_SSH_OPTIONS="${BASTION_SSH_OPTIONS}"
+  cat > "${PROFILES_DIR}/${slug}.env" <<EOF
+BASTION_LABEL="${label}"
+BASTION_SESSION="${slug}"
+BASTION_HOST="${host}"
+BASTION_PORT="${port}"
+BASTION_USER="${user}"
+BASTION_SSH_OPTIONS="${opts}"
 EOF
-  chmod 600 "${CONFIG_FILE}"
-  echo "Saved ${CONFIG_FILE}."
+  chmod 600 "${PROFILES_DIR}/${slug}.env"
 }
 
-configure_bastion() {
-  if [[ -f "${CONFIG_FILE}" ]]; then
-    # shellcheck disable=SC1090
-    source "${CONFIG_FILE}"
-    echo "Confirm bastion info; press Enter to keep each current value:"
-  else
-    echo "First run. Enter bastion info; it will be saved to ${CONFIG_FILE}:"
+remember_active() {
+  # args: slug session
+  printf '%s\n' "$1" > "${LAST_PROFILE_FILE}" 2>/dev/null || true
+  printf '%s\n' "$2" > "${ACTIVE_SESSION_FILE}" 2>/dev/null || true
+  chmod 600 "${LAST_PROFILE_FILE}" "${ACTIVE_SESSION_FILE}" 2>/dev/null || true
+}
+
+load_profile() {
+  local slug="$1"
+  local file="${PROFILES_DIR}/${slug}.env"
+  if [[ ! -r "${file}" ]]; then
+    echo "profile not found: ${slug}" >&2
+    exit 1
   fi
-
-  prompt_with_default BASTION_HOST "Bastion host or IP" "${BASTION_HOST:-${DEFAULT_BASTION_HOST}}"
-  prompt_with_default BASTION_PORT "Bastion port" "${BASTION_PORT:-${DEFAULT_BASTION_PORT}}"
-  prompt_with_default BASTION_USER "Bastion user" "${BASTION_USER:-${DEFAULT_BASTION_USER}}"
-  prompt_with_default BASTION_SSH_OPTIONS "Extra SSH options" "${BASTION_SSH_OPTIONS:-${DEFAULT_BASTION_SSH_OPTIONS}}"
-  save_config
+  # shellcheck disable=SC1090
+  source "${file}"
+  SESSION="${BASTION_SESSION:-${slug}}"
+  remember_active "${slug}" "${SESSION}"
 }
 
-load_config() {
-  configure_bastion
+create_profile() {
+  echo "New profile:"
+  prompt_with_default PROFILE_LABEL "  Display name" "${DEFAULT_BASTION_HOST}"
+  local suggested
+  suggested="$(slugify "${PROFILE_LABEL}")"
+  [[ -n "${suggested}" ]] || suggested="cluster"
+  prompt_with_default PROFILE_SESSION "  Session id (ascii, tmux/file name)" "${suggested}"
+  PROFILE_SESSION="$(slugify "${PROFILE_SESSION}")"
+  [[ -n "${PROFILE_SESSION}" ]] || PROFILE_SESSION="cluster"
+  prompt_with_default BASTION_HOST "  Bastion host or IP" "${DEFAULT_BASTION_HOST}"
+  prompt_with_default BASTION_PORT "  Bastion port" "${DEFAULT_BASTION_PORT}"
+  prompt_with_default BASTION_USER "  Bastion user" "${DEFAULT_BASTION_USER}"
+  prompt_with_default BASTION_SSH_OPTIONS "  Extra SSH options" "${DEFAULT_BASTION_SSH_OPTIONS}"
+  write_profile_file "${PROFILE_SESSION}" "${PROFILE_LABEL}" "${BASTION_HOST}" \
+    "${BASTION_PORT}" "${BASTION_USER}" "${BASTION_SSH_OPTIONS}"
+  echo "Saved profile: ${PROFILES_DIR}/${PROFILE_SESSION}.env"
+  load_profile "${PROFILE_SESSION}"
+}
+
+migrate_legacy_config() {
+  # One-time: turn the old single ~/.ssh/bastion.env into a named profile.
+  [[ -f "${CONFIG_FILE}" ]] || return 0
+  local f
+  for f in "${PROFILES_DIR}"/*.env; do [[ -e "${f}" ]] && return 0; done
   # shellcheck disable=SC1090
   source "${CONFIG_FILE}"
+  echo "Migrating existing config (${CONFIG_FILE}) into a named profile:"
+  prompt_with_default PROFILE_LABEL "  Name this config" "${BASTION_HOST:-${DEFAULT_BASTION_HOST}}"
+  local slug
+  slug="$(slugify "${PROFILE_LABEL}")"
+  [[ -n "${slug}" ]] || slug="default"
+  prompt_with_default PROFILE_SESSION "  Session id (ascii)" "${slug}"
+  PROFILE_SESSION="$(slugify "${PROFILE_SESSION}")"
+  [[ -n "${PROFILE_SESSION}" ]] || PROFILE_SESSION="default"
+  write_profile_file "${PROFILE_SESSION}" "${PROFILE_LABEL}" "${BASTION_HOST}" \
+    "${BASTION_PORT:-22}" "${BASTION_USER}" "${BASTION_SSH_OPTIONS:-}"
+  echo "Migrated -> ${PROFILES_DIR}/${PROFILE_SESSION}.env"
+}
+
+pick_profile() {
+  mkdir -p "${PROFILES_DIR}"
+  migrate_legacy_config
+
+  local files=() f
+  for f in "${PROFILES_DIR}"/*.env; do [[ -e "${f}" ]] && files+=("${f}"); done
+  if [[ ${#files[@]} -eq 0 ]]; then
+    create_profile
+    return
+  fi
+
+  local last=""
+  [[ -r "${LAST_PROFILE_FILE}" ]] && last="$(head -1 "${LAST_PROFILE_FILE}" | tr -d '[:space:]')"
+
+  echo "Available profiles:"
+  local i=1 default_idx=1
+  local -a slugs=()
+  for f in "${files[@]}"; do
+    local slug label host user mark=""
+    slug="$(basename "${f}" .env)"
+    label="$(sed -n 's/^BASTION_LABEL="\(.*\)"$/\1/p' "${f}")"
+    host="$(sed -n 's/^BASTION_HOST="\(.*\)"$/\1/p' "${f}")"
+    user="$(sed -n 's/^BASTION_USER="\(.*\)"$/\1/p' "${f}")"
+    [[ -n "${label}" ]] || label="${slug}"
+    if [[ "${slug}" == "${last}" ]]; then mark="   [last]"; default_idx=${i}; fi
+    printf '  %d) %s   (%s@%s, session=%s)%s\n' "${i}" "${label}" "${user}" "${host}" "${slug}" "${mark}"
+    slugs[${i}]="${slug}"
+    i=$((i + 1))
+  done
+  local new_idx=${i}
+  printf '  %d) + new profile\n' "${new_idx}"
+
+  local choice=""
+  printf 'Select [%d]: ' "${default_idx}"
+  IFS= read -r choice || choice=""
+  [[ -n "${choice}" ]] || choice="${default_idx}"
+
+  if [[ "${choice}" == "${new_idx}" ]]; then
+    create_profile
+    return
+  fi
+  if [[ ! "${choice}" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#files[@]} )); then
+    echo "Invalid choice: ${choice}" >&2
+    exit 1
+  fi
+  load_profile "${slugs[${choice}]}"
+}
+
+validate_loaded_config() {
+  local ok=0
+  [[ -n "${BASTION_HOST:-}" ]] || { echo "config: BASTION_HOST is empty" >&2; ok=1; }
+  [[ -n "${BASTION_USER:-}" ]] || { echo "config: BASTION_USER is empty" >&2; ok=1; }
+  [[ "${BASTION_PORT:-22}" =~ ^[0-9]+$ ]] || { echo "config: BASTION_PORT must be numeric" >&2; ok=1; }
+  return "${ok}"
 }
 
 check_config() {
-  local ok=0 mode
-
-  if [[ ! -f "${CONFIG_FILE}" ]]; then
-    echo "config: missing ${CONFIG_FILE}" >&2
-    return 1
+  # Report saved profiles (used by `doctor`).
+  mkdir -p "${PROFILES_DIR}" 2>/dev/null || true
+  local f n=0
+  for f in "${PROFILES_DIR}"/*.env; do [[ -e "${f}" ]] && n=$((n + 1)); done
+  if [[ "${n}" -eq 0 && ! -f "${CONFIG_FILE}" ]]; then
+    echo "  no profiles yet in ${PROFILES_DIR} (create one with: up)"
+    return 0
   fi
-
-  # shellcheck disable=SC1090
-  source "${CONFIG_FILE}"
-
-  if [[ -z "${BASTION_HOST:-}" ]]; then
-    echo "config: BASTION_HOST is empty" >&2
-    ok=1
-  fi
-  if [[ -z "${BASTION_USER:-}" ]]; then
-    echo "config: BASTION_USER is empty" >&2
-    ok=1
-  fi
-  if [[ ! "${BASTION_PORT:-22}" =~ ^[0-9]+$ ]]; then
-    echo "config: BASTION_PORT must be numeric" >&2
-    ok=1
-  fi
-
-  mode="$(config_mode)"
-  if [[ "${mode}" != "600" && "${mode}" != "400" && "${mode}" != "unknown" ]]; then
-    echo "config: ${CONFIG_FILE} mode is ${mode}; recommended 600" >&2
-  fi
-
-  return "${ok}"
+  echo "  ${n} profile(s) in ${PROFILES_DIR}"
+  [[ -r "${ACTIVE_SESSION_FILE}" ]] && echo "  active session: $(head -1 "${ACTIVE_SESSION_FILE}")"
+  return 0
 }
 
 clean_spools() {
@@ -235,6 +329,9 @@ doctor() {
 
 start_session() {
   check_deps
+  ensure_runtime_dirs
+  pick_profile
+  validate_loaded_config || { echo "Fix the profile and retry." >&2; exit 1; }
 
   if session_exists; then
     echo "tmux ${SESSION} already exists."
@@ -246,10 +343,6 @@ start_session() {
     echo "Restarting tmux ${SESSION}."
     tmux kill-session -t "${SESSION}"
   fi
-
-  load_config
-  ensure_runtime_dirs
-  check_config
 
   local target="${BASTION_USER}@${BASTION_HOST}"
   local port="${BASTION_PORT:-22}"
